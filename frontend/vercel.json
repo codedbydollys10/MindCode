@@ -1,0 +1,44 @@
+{
+  "rewrites": [
+    {
+      "source": "/run",
+      "destination": "https://mindcode-4v9p.onrender.com/run"
+    },
+    {
+      "source": "/execute",
+      "destination": "https://mindcode-4v9p.onrender.com/execute"
+    },
+    {
+      "source": "/question",
+      "destination": "https://mindcode-4v9p.onrender.com/question"
+    },
+    {
+      "source": "/analysis",
+      "destination": "https://mindcode-4v9p.onrender.com/analysis"
+    },
+    {
+      "source": "/submit-code",
+      "destination": "https://mindcode-4v9p.onrender.com/submit-code"
+    },
+    {
+      "source": "/generate-report",
+      "destination": "https://mindcode-4v9p.onrender.com/generate-report"
+    },
+    {
+      "source": "/generate-recommendations",
+      "destination": "https://mindcode-4v9p.onrender.com/generate-recommendations"
+    },
+    {
+      "source": "/log-keystrokes-batch",
+      "destination": "https://mindcode-4v9p.onrender.com/log-keystrokes-batch"
+    },
+    {
+      "source": "/api/keystroke-log",
+      "destination": "https://mindcode-4v9p.onrender.com/api/keystroke-log"
+    },
+    {
+      "source": "/api/keystroke-logs",
+      "destination": "https://mindcode-4v9p.onrender.com/api/keystroke-logs"
+    }
+  ]
+}
