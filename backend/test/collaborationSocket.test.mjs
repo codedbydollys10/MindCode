@@ -140,7 +140,9 @@ test('authenticated clients sync only within their joined room and reconnect fro
   };
 
   const firstRoom = await createRoom('tokenA');
+  assert.equal(rooms.get(firstRoom.room.id).room_code, firstRoom.room.id);
   const otherRoom = await createRoom('tokenA');
+  assert.equal(rooms.get(otherRoom.room.id).room_code, otherRoom.room.id);
   const joinResponse = await fetch(`${apiBase}/api/collaboration/rooms/${firstRoom.room.id}/join`, {
     method: 'POST',
     headers: { authorization: 'Bearer tokenB', 'content-type': 'application/json' },

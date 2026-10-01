@@ -10,6 +10,7 @@ import { useSupabaseAuth } from "@/hooks/useSupabaseAuth";
 import { useCollaborationRoom } from "@/hooks/useCollaborationRoom";
 import { runCode } from "@/lib/codeRunner";
 import { getSupabaseClient } from "@/lib/supabase";
+import CodingMentorPanel, { type CodingMentorRun } from "@/components/CodingMentorPanel";
 
 const languages = ["python", "javascript", "java", "cpp", "c", "go", "rust"] as const;
 type SupportedLanguage = (typeof languages)[number];
@@ -17,6 +18,7 @@ type SupportedLanguage = (typeof languages)[number];
 const API_BASE = import.meta.env.VITE_COLLABORATION_API_URL
   || import.meta.env.VITE_CODE_RUNNER_URL
   || (import.meta.env.DEV ? "http://localhost:3001" : "https://mindcode-4v9p.onrender.com");
+const MENTOR_API_BASE = import.meta.env.VITE_AI_API_BASE || API_BASE;
 
 const CollaborativeCoding = () => {
   const { roomId } = useParams();
@@ -34,9 +36,11 @@ const CollaborativeCoding = () => {
   const [stdin, setStdin] = useState("");
   const [output, setOutput] = useState("");
   const [runError, setRunError] = useState<string | null>(null);
+  const [mentorRun, setMentorRun] = useState<CodingMentorRun | null>(null);
   const [copied, setCopied] = useState(false);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const bindingRef = useRef<MonacoBinding | null>(null);
+  const mentorRunIdRef = useRef(0);
 
   useEffect(() => {
     if (!document || !editorRef.current) return;
@@ -94,19 +98,38 @@ const CollaborativeCoding = () => {
     if (!document || !room) return;
     setRunning(true);
     setRunError(null);
+    const code = document.getText("code").toString();
+    const runId = ++mentorRunIdRef.current;
+    if (!code.trim()) {
+      const message = "Add code before running it.";
+      setOutput(message);
+      setMentorRun({ id: runId, language: room.language, code });
+      setRunning(false);
+      return;
+    }
     setOutput("Running shared code...");
     try {
       const result = await runCode({
         language: room.language as SupportedLanguage,
-        code: document.getText("code").toString(),
+        code,
         stdin,
       });
       setOutput(result.output || result.error || result.status || "No output received.");
       if (result.error) setRunError(result.error);
+      setMentorRun({
+        id: runId,
+        language: room.language,
+        code,
+        error: result.error,
+        output: result.output,
+        status: result.status,
+        statusId: result.statusId,
+      });
     } catch (executionError) {
       const message = executionError instanceof Error ? executionError.message : "Unable to run code.";
       setRunError(message);
       setOutput(message);
+      setMentorRun({ id: runId, language: room.language, code, error: message, executionUnavailable: true });
     } finally {
       setRunning(false);
     }
@@ -271,6 +294,7 @@ const CollaborativeCoding = () => {
                 {output || "Run the shared code to see output."}
               </div>
               {runError && <p className="text-xs text-rose">{runError}</p>}
+              {room && <CodingMentorPanel key={room.id} apiBase={MENTOR_API_BASE} roomId={room.id} run={mentorRun} />}
             </div>
           </section>
 

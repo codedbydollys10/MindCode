@@ -358,6 +358,7 @@ create index if not exists idx_recs_user on public.recommendations (user_id, cre
 -- access to these tables.
 create table if not exists public.collaboration_rooms (
   id uuid primary key,
+  room_code text not null unique,
   created_by uuid not null references auth.users(id) on delete cascade,
   invite_hash text not null unique,
   language text not null check (language in ('python', 'javascript', 'java', 'cpp', 'c', 'go', 'rust')),

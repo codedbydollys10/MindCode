@@ -58,6 +58,7 @@ export const createCollaborationRouter = ({ supabase }) => {
     const document = createCollaborationDocument(code, parsed.data.language);
     const room = {
       id,
+      room_code: id,
       created_by: req.collaborationUser.id,
       invite_hash: inviteHash(inviteCode),
       language: parsed.data.language,

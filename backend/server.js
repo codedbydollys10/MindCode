@@ -9,6 +9,7 @@ import Bytez from 'bytez.js';
 import 'dotenv/config';
 import http from 'http';
 import { attachCollaborationWebSocket, createCollaborationRouter } from './lib/collaboration.mjs';
+import { codingMentorRequestSchema, generateCodingMentorResponse } from './lib/codingMentor.mjs';
 
 const app = express();
 const server = http.createServer(app);
@@ -1352,6 +1353,20 @@ app.post('/analyze', async (req, res) => {
   } catch (err) {
     console.error('[analyze]', err.message || err);
     res.json(fallbackAnalysis);
+  }
+});
+
+app.post('/mentor', async (req, res) => {
+  const parsed = codingMentorRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid coding mentor request.' });
+  }
+  try {
+    const response = await generateCodingMentorResponse(parsed.data, callLLM, parseJsonLoose);
+    return res.json(response);
+  } catch (err) {
+    console.error('[mentor]', err?.message || err);
+    return res.status(503).json({ error: 'AI Mentor is temporarily unavailable.' });
   }
 });
 
