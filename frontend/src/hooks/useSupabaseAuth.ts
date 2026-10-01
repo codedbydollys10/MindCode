@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import type { Provider, Session, User } from "@supabase/supabase-js";
 import { getSupabaseClient, hasSupabaseEnv, logSupabaseError, upsertUserProfile } from "@/lib/supabase";
+import { getUserRoleFromUser } from "@/lib/userRole";
 
 type AuthError = string | null;
 
@@ -26,7 +27,7 @@ export const useSupabaseAuth = () => {
       provider: user.app_metadata?.provider || user.identities?.[0]?.provider || null,
       lastSignInAt: user.last_sign_in_at,
       createdAt: user.created_at,
-      name: (user.user_metadata as any)?.name ?? null,
+      name: typeof user.user_metadata?.name === "string" ? user.user_metadata.name : null,
     });
   }, []);
 
@@ -67,7 +68,7 @@ export const useSupabaseAuth = () => {
     });
 
     return () => subscription.unsubscribe();
-  }, [persistProfile, hasSupabaseEnv]);
+  }, [persistProfile]);
 
   const signInWithPassword = async (email: string, password: string) => {
     ensureEnv();
@@ -186,7 +187,7 @@ export const useSupabaseAuth = () => {
   return {
     session,
     user: session?.user ?? null,
-    userRole: "student" as const,
+    userRole: getUserRoleFromUser(session?.user),
     loading,
     error,
     signInWithPassword,

@@ -60,6 +60,8 @@ export type AssessmentReport = {
   testId: string;
   createdAt: number;
   language: string;
+  languageAvailable?: boolean;
+  focusScoreAvailable?: boolean;
   difficulty: string;
   problemTitle: string;
   skillScores: SkillScores;
@@ -135,6 +137,7 @@ type AssessmentState = {
   lineMetrics: Record<number, LineMetric>;
   behaviorTimeline: BehaviorPoint[];
   reports: AssessmentReport[];
+  reportCount: number | null;
   focusDrops: number;
   fullscreenExits: number;
   runVerdict: RunVerdict | null;
@@ -355,6 +358,7 @@ export const useAssessmentSession = create<AssessmentState>((set, get) => ({
   lineMetrics: {},
   behaviorTimeline: [],
   reports: [],
+  reportCount: null,
   focusDrops: 0,
   fullscreenExits: 0,
   runVerdict: null,
@@ -764,11 +768,17 @@ export const useAssessmentSession = create<AssessmentState>((set, get) => ({
         runVerdict: sessionRunVerdict,
       };
 
-      set((s) => ({ reports: [report, ...s.reports].slice(0, 20) }));
+      set((s) => ({
+        reports: [report, ...s.reports].slice(0, 20),
+        reportCount: s.reportCount === null ? s.reports.length + 1 : s.reportCount + 1,
+      }));
       finalReport = report;
     } catch (err) {
       console.warn("backend analysis failed, using local fallback", err);
-      set((s) => ({ reports: [fallbackReport, ...s.reports].slice(0, 20) }));
+      set((s) => ({
+        reports: [fallbackReport, ...s.reports].slice(0, 20),
+        reportCount: s.reportCount === null ? s.reports.length + 1 : s.reportCount + 1,
+      }));
     }
 
     // Store submission to Supabase via backend
@@ -867,14 +877,14 @@ export const useAssessmentSession = create<AssessmentState>((set, get) => ({
   },
 
   loadReports: async () => {
-    if (!hasSupabaseEnv) return;
+    if (!hasSupabaseEnv) throw new Error("Supabase is not configured.");
     try {
       const supa = getSupabaseClient();
       const { data: { user } } = await supa.auth.getUser();
-      if (!user) return;
-      const { data, error } = await supa
+      if (!user) throw new Error("Sign in to load your reports.");
+      const { data, error, count } = await supa
         .from("reports")
-        .select("id, created_at, test_id, problem_breakdown_score, debugging_score, focus_score, planning_score, flexibility_score, heatmap_data, summary, skill_tests(language,difficulty,question,topic)")
+        .select("id, created_at, test_id, problem_breakdown_score, debugging_score, focus_score, planning_score, flexibility_score, heatmap_data, summary, skill_tests(language,difficulty,question,topic)", { count: "exact" })
         .eq("user_id", user.id)
         .order("created_at", { ascending: false })
         .limit(50);
@@ -1328,6 +1338,8 @@ export const useAssessmentSession = create<AssessmentState>((set, get) => ({
         testId: String((r as any).test_id || r.id),
         createdAt: new Date(r.created_at || Date.now()).getTime(),
         language: testMeta?.language || "python",
+        languageAvailable: Boolean(testMeta?.language),
+        focusScoreAvailable: r.focus_score !== null && r.focus_score !== undefined && Number.isFinite(Number(r.focus_score)),
         difficulty: uiDifficulty,
         problemTitle: maybeTitle || testMeta?.topic || testMeta?.question?.slice(0, 40) || "Assessment",
         skillScores: scores,
@@ -1347,9 +1359,10 @@ export const useAssessmentSession = create<AssessmentState>((set, get) => ({
         runVerdict,
       } as AssessmentReport;
       });
-      set({ reports: mapped });
+      set({ reports: mapped, reportCount: count ?? mapped.length });
     } catch (err) {
-      console.warn("supabase load reports failed", err);
+      console.error("supabase load reports failed", err);
+      throw err;
     }
   },
 }));

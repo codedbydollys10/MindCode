@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   Play,
@@ -34,6 +34,8 @@ import {
 import GlowButton from "@/components/GlowButton";
 import DifficultyBadge from "@/components/DifficultyBadge";
 import { useAssessmentSession, formatDate } from "@/hooks/useAssessmentSession";
+import { useSupabaseAuth } from "@/hooks/useSupabaseAuth";
+import { getSupabaseClient } from "@/lib/supabase";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import DashboardSidebar from "@/components/DashboardSidebar";
@@ -43,6 +45,7 @@ const difficulties = ["easy", "medium", "hard"];
 
 const Dashboard = () => {
   const navigate = useNavigate();
+  const { user } = useSupabaseAuth();
   const {
     reports,
     startAssessment,
@@ -52,6 +55,7 @@ const Dashboard = () => {
   const [language, setLanguage] = useState("python");
   const [difficulty, setDifficulty] = useState("medium");
   const [radarMode, setRadarMode] = useState<"latest" | "average">("latest");
+  const userAdjustedSelection = useRef(false);
 
   const safeReports = useMemo(
     () =>
@@ -153,6 +157,35 @@ const Dashboard = () => {
   useEffect(() => {
     loadReports().catch(() => {});
   }, [loadReports]);
+
+  useEffect(() => {
+    userAdjustedSelection.current = false;
+    if (!user) return;
+    let active = true;
+    const loadPreferences = async () => {
+      try {
+        const { data, error } = await getSupabaseClient().from("users")
+          .select("preferred_language,difficulty_bias")
+          .eq("id", user.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (!active || userAdjustedSelection.current || !data) return;
+        if (languages.includes(data.preferred_language)) setLanguage(data.preferred_language);
+        const difficultyByPreference: Record<string, string> = {
+          "Hard-first": "hard",
+          "Easy warmups": "easy",
+          Balanced: "medium",
+          "Medium-focused": "medium",
+        };
+        const preferredDifficulty = difficultyByPreference[data.difficulty_bias];
+        if (preferredDifficulty) setDifficulty(preferredDifficulty);
+      } catch (error) {
+        console.warn("[Dashboard] Unable to load saved practice preferences:", error);
+      }
+    };
+    void loadPreferences();
+    return () => { active = false; };
+  }, [user]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -379,7 +412,7 @@ const Dashboard = () => {
                 {languages.map((lang) => (
                   <button
                     key={lang}
-                    onClick={() => setLanguage(lang)}
+                    onClick={() => { userAdjustedSelection.current = true; setLanguage(lang); }}
                     className={cn(
                       "rounded-btn px-3 py-2 border text-sm capitalize",
                       language === lang ? "border-teal text-foreground bg-teal/10" : "border-border text-muted-foreground hover:text-foreground"
@@ -396,7 +429,7 @@ const Dashboard = () => {
                 {difficulties.map((lvl) => (
                   <button
                     key={lvl}
-                    onClick={() => setDifficulty(lvl)}
+                    onClick={() => { userAdjustedSelection.current = true; setDifficulty(lvl); }}
                     className={cn(
                       "rounded-btn px-3 py-2 border text-sm capitalize",
                       difficulty === lvl ? "border-teal text-foreground bg-teal/10" : "border-border text-muted-foreground hover:text-foreground"

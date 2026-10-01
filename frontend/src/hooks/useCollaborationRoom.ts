@@ -8,6 +8,17 @@ export type CollaborationRoom = {
   roomCode?: string;
   language: string;
   role: "owner" | "member" | "teacher";
+  roomType?: "collaborative" | "teacher_assignment";
+  teacherId?: string | null;
+  assignment?: {
+    room_id: string;
+    room_name: string;
+    title: string;
+    teacher_name: string;
+    instructions: string;
+    deadline: string | null;
+    created_at: string;
+  } | null;
 };
 
 export type CollaborationParticipant = {

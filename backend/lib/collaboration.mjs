@@ -15,6 +15,18 @@ const roomIdSchema = z.string().min(3).max(64);
 const createRoomSchema = z.object({
   language: z.enum(['python', 'javascript', 'java', 'cpp', 'c', 'go', 'rust']).default('python'),
 });
+const createAssignmentSchema = z.object({
+  roomName: z.string().trim().min(1).max(120),
+  title: z.string().trim().min(1).max(120),
+  instructions: z.string().max(10000).default(''),
+  deadline: z.string().datetime().nullable().optional(),
+  language: z.enum(['python', 'javascript', 'java', 'cpp', 'c', 'go', 'rust']).default('python'),
+});
+const assignmentRoomCodeSchema = z.object({ roomCode: z.string().trim().min(3).max(64) });
+const assignmentCodeSchema = z.object({ code: z.string().max(20000) });
+const assignmentFeedbackRequestSchema = z.object({ message: z.string().trim().max(2000).default('') });
+const assignmentRunSchema = z.object({ hasError: z.boolean() });
+const assignmentFeedbackSchema = z.object({ message: z.string().trim().min(1).max(2000), concept: z.string().trim().max(120).optional() });
 const joinRoomSchema = z.object({ inviteCode: z.string().min(20).max(100) });
 const roomRequestDecisionSchema = z.object({ decision: z.enum(['accepted', 'rejected']) });
 const teacherInviteSchema = z.object({ inviteCode: z.string().min(20).max(100).optional() });
@@ -51,7 +63,7 @@ const resolveRoomRecord = async (supabase, identifier) => {
   if (idLookup.success) {
     const { data: roomById, error: idError } = await supabase
       .from('collaboration_rooms')
-      .select('id, room_code, created_by, invite_hash, language, content_state, created_at, updated_at')
+      .select('id, room_code, created_by, teacher_id, invite_hash, language, room_type, content_state, created_at, updated_at')
       .eq('id', candidate)
       .maybeSingle();
     if (idError) throw idError;
@@ -60,7 +72,7 @@ const resolveRoomRecord = async (supabase, identifier) => {
 
   const { data: roomByCode, error: codeError } = await supabase
     .from('collaboration_rooms')
-    .select('id, room_code, created_by, invite_hash, language, content_state, created_at, updated_at')
+    .select('id, room_code, created_by, teacher_id, invite_hash, language, room_type, content_state, created_at, updated_at')
     .eq('room_code', normalized)
     .maybeSingle();
   if (codeError) throw codeError;
@@ -76,15 +88,30 @@ const displayName = (user) => {
   return String(user.email || 'Participant').split('@')[0].slice(0, 80);
 };
 
+const userRole = (user) => user.app_metadata?.role === 'teacher' ? 'teacher' : 'student';
+
+const getAssignment = async (supabase, roomId) => {
+  const { data, error } = await supabase.from('collaboration_assignments')
+    .select('room_id, room_name, title, teacher_name, instructions, deadline, created_at')
+    .eq('room_id', roomId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+};
+
 const isMissingCollaborationSchemaError = (error) => {
   if (!error) return false;
   const text = [error.message, error.details, error.hint, error.code].filter(Boolean).join(' ');
-  return error.code === '42P01' || /could not find the table|does not exist/i.test(text);
+  return error.code === '42P01'
+    || error.code === '42703'
+    || error.code === 'PGRST204'
+    || error.code === 'PGRST205'
+    || /could not find the (?:table|column)|does not exist/i.test(text);
 };
 
 const collaborationSchemaError = () => ({
   status: 503,
-  message: 'The collaboration tables are missing in Supabase. Apply the SQL in frontend/supabase_schema.sql to the live database before creating rooms.',
+  message: 'The collaboration database schema is incomplete. Apply frontend/migrations/20261001_teacher_assignments.sql in the Supabase SQL editor, then retry.',
 });
 
 export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, requestErrorCorrection }) => {
@@ -106,6 +133,483 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     }
   });
 
+  router.post('/assignments', async (req, res) => {
+    if (userRole(req.collaborationUser) !== 'teacher') {
+      return res.status(403).json({ error: 'Only teacher accounts can create assignments.' });
+    }
+    const parsed = createAssignmentSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Enter a room name, assignment title, instructions, deadline, and supported language.' });
+
+    const roomId = randomUUID();
+    const roomCode = generateRoomCode();
+    const inviteCode = randomBytes(32).toString('base64url');
+    const document = createCollaborationDocument('', parsed.data.language);
+    try {
+      const { error: roomError } = await supabase.from('collaboration_rooms').insert({
+        id: roomId,
+        room_code: roomCode,
+        created_by: req.collaborationUser.id,
+        teacher_id: req.collaborationUser.id,
+        invite_hash: inviteHash(inviteCode),
+        language: parsed.data.language,
+        room_type: 'teacher_assignment',
+        content_state: encodeCollaborationState(document),
+      });
+      if (roomError) throw roomError;
+      const { error: assignmentError } = await supabase.from('collaboration_assignments').insert({
+        room_id: roomId,
+        room_name: parsed.data.roomName,
+        title: parsed.data.title,
+        teacher_name: displayName(req.collaborationUser),
+        instructions: parsed.data.instructions,
+        deadline: parsed.data.deadline || null,
+      });
+      if (assignmentError) throw assignmentError;
+      const { error: memberError } = await supabase.from('collaboration_room_members').insert({
+        room_id: roomId,
+        user_id: req.collaborationUser.id,
+        role: 'owner',
+      });
+      if (memberError) throw memberError;
+      return res.status(201).json({
+        room: { id: roomId, publicId: roomCode, roomCode, language: parsed.data.language, roomType: 'teacher_assignment', teacherId: req.collaborationUser.id },
+      });
+    } catch (error) {
+      await supabase.from('collaboration_rooms').delete().eq('id', roomId);
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment creation failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to create this teacher assignment.' });
+    } finally {
+      document.destroy();
+    }
+  });
+
+  router.post('/assignments/lookup', async (req, res) => {
+    if (userRole(req.collaborationUser) !== 'student') {
+      return res.status(403).json({ error: 'Only student accounts can join teacher assignments.' });
+    }
+    const parsed = assignmentRoomCodeSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Enter a valid assignment room code.' });
+    try {
+      const room = await resolveRoomRecord(supabase, parsed.data.roomCode);
+      if (!room || room.room_type !== 'teacher_assignment' || !room.teacher_id) {
+        return res.status(404).json({ error: 'No teacher assignment was found for this room code.' });
+      }
+      const assignment = await getAssignment(supabase, room.id);
+      if (!assignment) return res.status(404).json({ error: 'This assignment is no longer available.' });
+      return res.json({ room: { id: room.id, publicId: room.room_code, roomCode: room.room_code, language: room.language }, assignment });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment lookup failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to look up this assignment.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/join', async (req, res) => {
+    if (userRole(req.collaborationUser) !== 'student') {
+      return res.status(403).json({ error: 'Only student accounts can join teacher assignments.' });
+    }
+    const roomId = roomIdSchema.safeParse(req.params.roomId);
+    if (!roomId.success) return res.status(400).json({ error: 'Invalid assignment room.' });
+    try {
+      const room = await resolveRoomRecord(supabase, req.params.roomId);
+      if (!room || room.room_type !== 'teacher_assignment' || !room.teacher_id) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      const { data: existing, error: existingError } = await supabase.from('collaboration_room_members')
+        .select('role').eq('room_id', room.id).eq('user_id', req.collaborationUser.id).maybeSingle();
+      if (existingError) throw existingError;
+      if (existing?.role === 'owner' || existing?.role === 'teacher') {
+        return res.status(403).json({ error: 'Assignment teachers cannot join as students.' });
+      }
+      const { error: memberError } = await supabase.from('collaboration_room_members').upsert({
+        room_id: room.id,
+        user_id: req.collaborationUser.id,
+        role: 'member',
+      }, { onConflict: 'room_id,user_id' });
+      if (memberError) throw memberError;
+      const assignment = await getAssignment(supabase, room.id);
+      return res.json({ room: { id: room.id, publicId: room.room_code, roomCode: room.room_code, language: room.language, roomType: room.room_type, teacherId: room.teacher_id, role: 'member', assignment } });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment join failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to join this assignment.' });
+    }
+  });
+
+  const getAssignmentMember = async (roomIdentifier, user) => {
+    const room = await resolveRoomRecord(supabase, roomIdentifier);
+    if (!room || room.room_type !== 'teacher_assignment' || !room.teacher_id) {
+      return { room: null, member: null, isStudent: false, isTeacherOwner: false };
+    }
+    const { data: member, error } = await supabase.from('collaboration_room_members')
+      .select('role').eq('room_id', room.id).eq('user_id', user.id).maybeSingle();
+    if (error) throw error;
+    return {
+      room,
+      member,
+      isStudent: userRole(user) === 'student' && member?.role === 'member',
+      isTeacherOwner: userRole(user) === 'teacher' && room.teacher_id === user.id && member?.role === 'owner',
+    };
+  };
+
+  const readProgress = async (roomId, userId) => {
+    const { data, error } = await supabase.from('collaboration_assignment_progress')
+      .select('room_id, user_id, code_runs, attempts, errors, submission_status, submitted_at, updated_at')
+      .eq('room_id', roomId).eq('user_id', userId).maybeSingle();
+    if (error) throw error;
+    return data || {
+      room_id: roomId,
+      user_id: userId,
+      code_runs: 0,
+      attempts: 0,
+      errors: 0,
+      submission_status: 'Pending',
+      submitted_at: null,
+    };
+  };
+
+  router.get('/assignments', async (req, res) => {
+    if (userRole(req.collaborationUser) !== 'teacher') {
+      return res.status(403).json({ error: 'Only teacher accounts can view assignment rooms.' });
+    }
+    try {
+      const { data: rooms, error } = await supabase.from('collaboration_rooms')
+        .select('id, room_code, language, created_at')
+        .eq('teacher_id', req.collaborationUser.id)
+        .eq('room_type', 'teacher_assignment');
+      if (error) throw error;
+      const assignments = await Promise.all((rooms || []).map(async (room) => ({
+        id: room.id,
+        roomCode: room.room_code,
+        language: room.language,
+        createdAt: room.created_at,
+        assignment: await getAssignment(supabase, room.id),
+      })));
+      return res.json({ assignments });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] teacher assignment list failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to load your assignment rooms.' });
+    }
+  });
+
+  router.get('/assignments/:roomId', async (req, res) => {
+    try {
+      const { room, member, isStudent, isTeacherOwner } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent && !isTeacherOwner) return res.status(403).json({ error: 'Join this assignment to access its workspace.' });
+      const assignment = await getAssignment(supabase, room.id);
+      if (!assignment) return res.status(404).json({ error: 'This assignment is no longer available.' });
+      return res.json({ assignment, role: member.role });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment details failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to load this assignment.' });
+    }
+  });
+
+  router.get('/assignments/:roomId/progress', async (req, res) => {
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only an enrolled student can view personal assignment progress.' });
+      const [progress, { data: submissions, error: submissionError }, { data: executionHistory, error: executionError }] = await Promise.all([
+        readProgress(room.id, req.collaborationUser.id),
+        supabase.from('collaboration_assignment_submissions').select('id, assignment_id, workspace_id, code, attempt, submitted_at')
+          .eq('room_id', room.id).eq('user_id', req.collaborationUser.id).order('submitted_at', { ascending: false }),
+        supabase.from('collaboration_assignment_runs').select('id, has_error, ran_at')
+          .eq('room_id', room.id).eq('user_id', req.collaborationUser.id).order('ran_at', { ascending: false }),
+      ]);
+      if (submissionError) throw submissionError;
+      if (executionError) throw executionError;
+      return res.json({ progress, submissions: submissions || [], executionHistory: executionHistory || [] });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] student progress load failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to load assignment progress.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/run', async (req, res) => {
+    const body = assignmentRunSchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ error: 'Invalid code execution result.' });
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only enrolled students can record assignment runs.' });
+      const ranAt = new Date().toISOString();
+      const { data: run, error: runError } = await supabase.from('collaboration_assignment_runs').insert({
+        room_id: room.id,
+        user_id: req.collaborationUser.id,
+        has_error: body.data.hasError,
+        ran_at: ranAt,
+      }).select('id, has_error, ran_at').maybeSingle();
+      if (runError) throw runError;
+      const current = await readProgress(room.id, req.collaborationUser.id);
+      const progress = {
+        ...current,
+        code_runs: current.code_runs + 1,
+        errors: current.errors + (body.data.hasError ? 1 : 0),
+        updated_at: ranAt,
+      };
+      const { error } = await supabase.from('collaboration_assignment_progress').upsert(progress, { onConflict: 'room_id,user_id' });
+      if (error) throw error;
+      return res.json({ progress, run });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment run tracking failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to record this assignment run.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/save', async (req, res) => {
+    const body = assignmentCodeSchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ error: 'Code must be 20,000 characters or fewer.' });
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only enrolled students can save assignment work.' });
+      const { data: workspace, error: workspaceError } = await supabase.from('collaboration_assignment_workspaces')
+        .select('room_id').eq('room_id', room.id).eq('user_id', req.collaborationUser.id).maybeSingle();
+      if (workspaceError) throw workspaceError;
+      if (!workspace) return res.status(409).json({ error: 'The personal workspace is not ready. Reconnect and try again.' });
+      const savedAt = new Date().toISOString();
+      const { error } = await supabase.from('collaboration_assignment_workspaces').update({
+        saved_code: body.data.code,
+        saved_at: savedAt,
+        updated_at: savedAt,
+      }).eq('room_id', room.id).eq('user_id', req.collaborationUser.id);
+      if (error) throw error;
+      return res.json({ savedAt });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment save failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to save assignment work.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/submit', async (req, res) => {
+    const body = assignmentCodeSchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ error: 'Code must be 20,000 characters or fewer.' });
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only enrolled students can submit assignment work.' });
+      const current = await readProgress(room.id, req.collaborationUser.id);
+      const attempt = current.attempts + 1;
+      const submittedAt = new Date().toISOString();
+      const { data: workspace, error: workspaceError } = await supabase.from('collaboration_assignment_workspaces')
+        .select('id').eq('room_id', room.id).eq('user_id', req.collaborationUser.id).maybeSingle();
+      if (workspaceError) throw workspaceError;
+      const { data: submission, error: submissionError } = await supabase.from('collaboration_assignment_submissions').insert({
+        room_id: room.id,
+        assignment_id: room.id,
+        workspace_id: workspace?.id || null,
+        user_id: req.collaborationUser.id,
+        code: body.data.code,
+        attempt,
+        submitted_at: submittedAt,
+      }).select('id, code, attempt, submitted_at').maybeSingle();
+      if (submissionError) throw submissionError;
+      const progress = {
+        ...current,
+        attempts: attempt,
+        submission_status: 'Submitted',
+        submitted_at: submittedAt,
+        updated_at: submittedAt,
+      };
+      const { error: progressError } = await supabase.from('collaboration_assignment_progress').upsert(progress, { onConflict: 'room_id,user_id' });
+      if (progressError) throw progressError;
+      return res.status(201).json({ submission, progress });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment submission failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to submit this assignment.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/feedback-requests', async (req, res) => {
+    const body = assignmentFeedbackRequestSchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ error: 'Feedback request messages must be 2,000 characters or fewer.' });
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only enrolled students can request assignment feedback.' });
+      const { data, error } = await supabase.from('collaboration_assignment_feedback_requests').insert({
+        room_id: room.id,
+        user_id: req.collaborationUser.id,
+        message: body.data.message,
+        status: 'pending',
+      }).select('id, status, requested_at, message').maybeSingle();
+      if (error) throw error;
+      return res.status(201).json({ request: data });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] feedback request failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to request teacher feedback.' });
+    }
+  });
+
+  router.get('/assignments/:roomId/feedback', async (req, res) => {
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only enrolled students can view personal teacher feedback.' });
+      const [{ data: feedback, error }, { data: requests, error: requestError }] = await Promise.all([
+        supabase.from('collaboration_assignment_feedback').select('id, author_id, message, concept, is_read, created_at').eq('room_id', room.id).eq('user_id', req.collaborationUser.id),
+        supabase.from('collaboration_assignment_feedback_requests').select('id, status, requested_at, message').eq('room_id', room.id).eq('user_id', req.collaborationUser.id),
+      ]);
+      if (error) throw error;
+      if (requestError) throw requestError;
+      return res.json({ feedback: feedback || [], requests: requests || [] });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment feedback load failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to load teacher feedback.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/feedback/:feedbackId/read', async (req, res) => {
+    const feedbackId = z.string().uuid().safeParse(req.params.feedbackId);
+    if (!feedbackId.success) return res.status(400).json({ error: 'Invalid feedback entry.' });
+    try {
+      const { room, isStudent } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isStudent) return res.status(403).json({ error: 'Only the feedback recipient can mark it as read.' });
+      const { data, error } = await supabase.from('collaboration_assignment_feedback').update({ is_read: true })
+        .eq('id', feedbackId.data).eq('room_id', room.id).eq('user_id', req.collaborationUser.id)
+        .select('id').maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: 'Feedback entry not found.' });
+      return res.json({ read: true });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] feedback read update failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to update feedback status.' });
+    }
+  });
+
+  router.get('/assignments/:roomId/monitoring', async (req, res) => {
+    try {
+      const { room, isTeacherOwner } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isTeacherOwner) return res.status(403).json({ error: 'Only the teacher who created this assignment can view student work.' });
+      const { data: members, error: membersError } = await supabase.from('collaboration_room_members')
+        .select('user_id, joined_at').eq('room_id', room.id).eq('role', 'member');
+      if (membersError) throw membersError;
+      const students = await Promise.all((members || []).map(async ({ user_id: userId, joined_at: joinedAt }) => {
+        const [progress, workspaceResult, submissionResult, executionResult, feedbackResult, requestResult] = await Promise.all([
+          readProgress(room.id, userId),
+          supabase.from('collaboration_assignment_workspaces').select('id, content_state, saved_code, saved_at').eq('room_id', room.id).eq('user_id', userId).maybeSingle(),
+          supabase.from('collaboration_assignment_submissions').select('id, assignment_id, workspace_id, code, attempt, submitted_at').eq('room_id', room.id).eq('user_id', userId).order('submitted_at', { ascending: false }),
+          supabase.from('collaboration_assignment_runs').select('id, has_error, ran_at').eq('room_id', room.id).eq('user_id', userId).order('ran_at', { ascending: false }),
+          supabase.from('collaboration_assignment_feedback').select('id, message, concept, is_read, created_at').eq('room_id', room.id).eq('user_id', userId),
+          supabase.from('collaboration_assignment_feedback_requests').select('id, status, requested_at, message').eq('room_id', room.id).eq('user_id', userId).order('requested_at', { ascending: false }),
+        ]);
+        if (workspaceResult.error) throw workspaceResult.error;
+        if (submissionResult.error) throw submissionResult.error;
+        if (executionResult.error) throw executionResult.error;
+        if (feedbackResult.error) throw feedbackResult.error;
+        if (requestResult.error) throw requestResult.error;
+        const privateDocument = workspaceResult.data?.content_state
+          ? restoreCollaborationDocument(workspaceResult.data.content_state)
+          : null;
+        const currentCode = privateDocument?.getText('code').toString() || '';
+        privateDocument?.destroy();
+        return {
+          userId,
+          joinedAt,
+          progress,
+          workspaceId: workspaceResult.data?.id || null,
+          savedCode: workspaceResult.data?.saved_code || '',
+          currentCode,
+          savedAt: workspaceResult.data?.saved_at || null,
+          submissions: submissionResult.data || [],
+          executionHistory: executionResult.data || [],
+          feedback: feedbackResult.data || [],
+          feedbackRequests: requestResult.data || [],
+        };
+      }));
+      return res.json({ students });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment monitoring failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to load assignment monitoring data.' });
+    }
+  });
+
+  router.post('/assignments/:roomId/monitoring/:userId/feedback', async (req, res) => {
+    const targetUserId = z.string().uuid().safeParse(req.params.userId);
+    const body = assignmentFeedbackSchema.safeParse(req.body);
+    if (!targetUserId.success || !body.success) return res.status(400).json({ error: 'Enter valid feedback for a student.' });
+    try {
+      const { room, isTeacherOwner } = await getAssignmentMember(req.params.roomId, req.collaborationUser);
+      if (!room) return res.status(404).json({ error: 'Teacher assignment not found.' });
+      if (!isTeacherOwner) return res.status(403).json({ error: 'Only the teacher who created this assignment can give feedback.' });
+      const { data: student, error: studentError } = await supabase.from('collaboration_room_members')
+        .select('user_id').eq('room_id', room.id).eq('user_id', targetUserId.data).eq('role', 'member').maybeSingle();
+      if (studentError) throw studentError;
+      if (!student) return res.status(404).json({ error: 'Student is not enrolled in this assignment.' });
+      const { data: feedback, error } = await supabase.from('collaboration_assignment_feedback').insert({
+        room_id: room.id,
+        user_id: targetUserId.data,
+        author_id: req.collaborationUser.id,
+        message: body.data.message,
+        concept: body.data.concept || null,
+      }).select('id, message, concept, created_at').maybeSingle();
+      if (error) throw error;
+      const { error: requestUpdateError } = await supabase.from('collaboration_assignment_feedback_requests').update({ status: 'fulfilled' })
+        .eq('room_id', room.id).eq('user_id', targetUserId.data).eq('status', 'pending');
+      if (requestUpdateError) throw requestUpdateError;
+      return res.status(201).json({ feedback });
+    } catch (error) {
+      if (isMissingCollaborationSchemaError(error)) {
+        const schemaError = collaborationSchemaError();
+        return res.status(schemaError.status).json({ error: schemaError.message });
+      }
+      console.error('[collaboration] assignment feedback submission failed:', error?.message || error);
+      return res.status(500).json({ error: 'Unable to send assignment feedback.' });
+    }
+  });
+
   router.post('/rooms', async (req, res) => {
     const parsed = createRoomSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'Choose a supported programming language.' });
@@ -121,6 +625,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
       created_by: req.collaborationUser.id,
       invite_hash: inviteHash(inviteCode),
       language: parsed.data.language,
+      room_type: 'collaborative',
       content_state: encodeCollaborationState(document),
     };
 
@@ -137,7 +642,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
         throw memberError;
       }
       return res.status(201).json({
-        room: { id, publicId: publicRoomId, roomCode: publicRoomId, language: room.language },
+        room: { id, publicId: publicRoomId, roomCode: publicRoomId, language: room.language, roomType: 'collaborative' },
         inviteCode,
       });
     } catch (error) {
@@ -162,6 +667,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'This invitation is invalid or expired.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Join teacher assignments with their assignment code.' });
       const { data: matchedRoom, error } = await supabase
         .from('collaboration_rooms')
         .select('id, room_code, language, created_by')
@@ -205,6 +711,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment sharing is managed from the teacher dashboard.' });
       const { data: member, error: memberError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -264,6 +771,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment rooms do not use teacher-invite access.' });
       if (req.collaborationUser.id === room.created_by) {
         return res.status(409).json({ error: 'The room owner cannot join as the invited teacher.' });
       }
@@ -327,6 +835,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment students join with the code shared by their teacher.' });
 
       const { data: member, error: memberError } = await supabase
         .from('collaboration_room_members')
@@ -377,6 +886,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment rooms do not use access requests.' });
       const { data: request, error } = await supabase
         .from('collaboration_room_join_requests')
         .select('status')
@@ -403,6 +913,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment rooms do not use access requests.' });
       const { data: owner, error: ownerError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -440,6 +951,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment rooms do not use access requests.' });
       const { data: owner, error: ownerError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -503,6 +1015,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Assignment rooms do not use access requests.' });
       const { data: member, error: memberError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -536,6 +1049,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Use assignment-specific private feedback.' });
       const { data: member, error: memberError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -571,6 +1085,7 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
     try {
       const room = await resolveRoomRecord(supabase, req.params.roomId);
       if (!room) return res.status(404).json({ error: 'Coding room not found.' });
+      if (room.room_type === 'teacher_assignment') return res.status(403).json({ error: 'Use assignment-specific private feedback.' });
       const { data: member, error: memberError } = await supabase
         .from('collaboration_room_members')
         .select('role')
@@ -605,7 +1120,27 @@ export const createCollaborationRouter = ({ supabase, supabaseAuth = supabase, r
       if (memberError) throw memberError;
       if (!member) return res.status(403).json({ error: 'You are not a member of this coding room.' });
 
-      return res.json({ room: { ...room, publicId: room.room_code || room.id, roomCode: room.room_code || room.id, role: member.role } });
+      if (room.room_type === 'teacher_assignment') {
+        const isAssignedTeacher = userRole(req.collaborationUser) === 'teacher'
+          && room.teacher_id === req.collaborationUser.id
+          && member.role === 'owner';
+        const isEnrolledStudent = userRole(req.collaborationUser) === 'student' && member.role === 'member';
+        if (!isAssignedTeacher && !isEnrolledStudent) {
+          return res.status(403).json({ error: 'You do not have access to this assignment workspace.' });
+        }
+      }
+
+      const assignment = room.room_type === 'teacher_assignment' ? await getAssignment(supabase, room.id) : null;
+      return res.json({ room: {
+        id: room.id,
+        publicId: room.room_code || room.id,
+        roomCode: room.room_code || room.id,
+        roomType: room.room_type || 'collaborative',
+        language: room.language,
+        teacherId: room.teacher_id,
+        role: member.role,
+        assignment,
+      } });
     } catch (error) {
       if (isMissingCollaborationSchemaError(error)) {
         console.error('[collaboration] room lookup failed because the collaboration schema is missing from Supabase.', error?.message || error);
@@ -638,10 +1173,19 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
         console.warn('[collaboration] room state exceeds persistence size limit:', roomId);
         return;
       }
-      const { error } = await supabase.from('collaboration_rooms').update({
-        content_state: contentState,
-        updated_at: new Date().toISOString(),
-      }).eq('id', roomId);
+      const update = roomState.assignment
+        ? roomState.persisted
+          ? supabase.from('collaboration_assignment_workspaces').update({
+            content_state: contentState,
+            updated_at: new Date().toISOString(),
+          }).eq('room_id', roomId).eq('user_id', roomState.userId)
+          : null
+        : supabase.from('collaboration_rooms').update({
+          content_state: contentState,
+          updated_at: new Date().toISOString(),
+        }).eq('id', roomId);
+      if (!update) return true;
+      const { error } = await update;
       if (error) {
         console.error('[collaboration] state persistence failed:', error.message);
         return false;
@@ -653,26 +1197,52 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
     }
   };
 
-  const getRoomState = async (roomId) => {
+  const getRoomState = async (roomId, userId, role) => {
     const resolvedRoom = await resolveRoomRecord(supabase, roomId);
     if (!resolvedRoom) return null;
-    const roomKey = resolvedRoom.id;
+    const isAssignment = resolvedRoom.room_type === 'teacher_assignment';
+    const roomKey = isAssignment ? `${resolvedRoom.id}:${userId}` : resolvedRoom.id;
     const existing = rooms.get(roomKey);
     if (existing) return existing;
     const pendingLoad = loadingRooms.get(roomKey);
     if (pendingLoad) return pendingLoad;
 
     const load = (async () => {
-      const { data: room, error } = await supabase
+      const resolvedId = isAssignment ? resolvedRoom.id : roomKey;
+      const { data: roomRecord, error: roomError } = await supabase
         .from('collaboration_rooms')
-        .select('id, room_code, language, content_state')
-        .eq('id', roomKey)
+        .select('id, room_code, language, room_type, content_state')
+        .eq('id', resolvedId)
         .maybeSingle();
-      if (error) throw error;
-      if (!room) return null;
+      if (roomError) throw roomError;
+      if (!roomRecord) return null;
 
-      const document = restoreCollaborationDocument(room.content_state);
-      const roomState = { document, language: room.language, clients: new Set(), saveTimer: null };
+      let contentState = roomRecord.content_state;
+      let persisted = true;
+      if (isAssignment) {
+        if (role === 'owner') {
+          contentState = '';
+          persisted = false;
+        } else {
+          const { data: workspace, error: workspaceError } = await supabase.from('collaboration_assignment_workspaces')
+            .select('content_state').eq('room_id', resolvedId).eq('user_id', userId).maybeSingle();
+          if (workspaceError) throw workspaceError;
+          contentState = workspace?.content_state || '';
+        }
+      }
+      const document = restoreCollaborationDocument(contentState);
+      if (isAssignment && role !== 'owner') {
+        const { error: workspaceError } = await supabase.from('collaboration_assignment_workspaces').upsert({
+          room_id: resolvedId,
+          user_id: userId,
+          content_state: encodeCollaborationState(document),
+        }, { onConflict: 'room_id,user_id' });
+        if (workspaceError) {
+          document.destroy();
+          throw workspaceError;
+        }
+      }
+      const roomState = { document, language: roomRecord.language, clients: new Set(), saveTimer: null, assignment: isAssignment, persisted, userId };
       document.on('update', (update, origin) => {
         const encodedUpdate = encodeCollaborationUpdate(update);
         for (const client of roomState.clients) {
@@ -681,7 +1251,7 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
         if (roomState.saveTimer) clearTimeout(roomState.saveTimer);
         roomState.saveTimer = setTimeout(() => {
           roomState.saveTimer = null;
-          void persistRoom(roomId, roomState);
+          void persistRoom(resolvedId, roomState);
         }, 750);
       });
       rooms.set(roomKey, roomState);
@@ -736,15 +1306,28 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
       return;
     }
 
-    const roomState = await getRoomState(resolvedRoom.id);
+    const isAssignment = resolvedRoom.room_type === 'teacher_assignment';
+    const isAssignmentTeacher = isAssignment
+      && userRole(user) === 'teacher'
+      && resolvedRoom.teacher_id === user.id
+      && member.role === 'owner';
+    const isAssignmentStudent = isAssignment && userRole(user) === 'student' && member.role === 'member';
+    if (isAssignment && !isAssignmentTeacher && !isAssignmentStudent) {
+      socket.close(4403, 'Assignment role required');
+      return;
+    }
+
+    const roomStateRole = isAssignmentTeacher ? 'owner' : isAssignment ? 'member' : member.role;
+    const roomState = await getRoomState(resolvedRoom.id, user.id, roomStateRole);
     if (!roomState) {
       socket.close(4404, 'Room not found');
       return;
     }
     socket.roomId = resolvedRoom.id;
+    socket.roomStateKey = resolvedRoom.room_type === 'teacher_assignment' ? `${resolvedRoom.id}:${user.id}` : resolvedRoom.id;
     socket.roomState = roomState;
     socket.userId = user.id;
-    socket.role = member.role === 'teacher' ? 'teacher' : member.role === 'owner' ? 'owner' : 'member';
+    socket.role = isAssignmentTeacher ? 'teacher' : member.role === 'teacher' ? 'teacher' : member.role === 'owner' ? 'owner' : 'member';
     socket.participantId = randomUUID();
     socket.participantName = displayName(user);
     roomState.clients.add(socket);
@@ -752,6 +1335,7 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
       type: 'sync',
       update: encodeCollaborationUpdate(Y.encodeStateAsUpdate(roomState.document)),
       language: roomState.language,
+      roomType: resolvedRoom.room_type || 'collaborative',
     });
     broadcastParticipants(roomState);
   };
@@ -807,8 +1391,8 @@ export const attachCollaborationWebSocket = ({ server, supabase, supabaseAuth = 
         if (roomState.saveTimer) clearTimeout(roomState.saveTimer);
         roomState.saveTimer = null;
         void persistRoom(socket.roomId, roomState).then((persisted) => {
-          if (!persisted || roomState.clients.size || rooms.get(socket.roomId) !== roomState) return;
-          rooms.delete(socket.roomId);
+          if (!persisted || roomState.clients.size || rooms.get(socket.roomStateKey) !== roomState) return;
+          rooms.delete(socket.roomStateKey);
           roomState.document.destroy();
         });
       }

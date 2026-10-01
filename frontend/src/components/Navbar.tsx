@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Brain, Menu, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSupabaseAuth } from "@/hooks/useSupabaseAuth";
+import UserAvatar from "@/components/UserAvatar";
 
 const studentLinks = [
   { label: "Home", to: "/dashboard" },
@@ -16,7 +18,10 @@ const Navbar = () => {
   const [scrolled, setScrolled] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const location = useLocation();
-  const visibleLinks = studentLinks;
+  const { user, userRole } = useSupabaseAuth();
+  const visibleLinks = userRole === "teacher"
+    ? [...studentLinks, { label: "Teacher Dashboard", to: "/teacher/dashboard" }]
+    : studentLinks;
 
   useEffect(() => {
     const handler = () => setScrolled(window.scrollY > 20);
@@ -58,7 +63,16 @@ const Navbar = () => {
           ))}
         </div>
 
-        <div className="flex items-center justify-end md:hidden">
+        <div className="hidden items-center justify-end md:flex">
+          {user && <Link to="/profile" aria-label="Your profile" className="rounded-full transition-transform hover:scale-105">
+            <UserAvatar userId={user.id} name={typeof user.user_metadata?.name === "string" ? user.user_metadata.name : user.email || ""} className="h-9 w-9" />
+          </Link>}
+        </div>
+
+        <div className="flex items-center justify-end gap-3 md:hidden">
+          {user && <Link to="/profile" aria-label="Your profile" className="rounded-full">
+            <UserAvatar userId={user.id} name={typeof user.user_metadata?.name === "string" ? user.user_metadata.name : user.email || ""} className="h-8 w-8" />
+          </Link>}
           <button
             className="text-foreground"
             onClick={() => setMobileOpen(!mobileOpen)}
