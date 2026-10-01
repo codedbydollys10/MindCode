@@ -1,5 +1,5 @@
 import { FormEvent, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Brain, Eye, EyeOff, Check } from "lucide-react";
 import GlowButton from "@/components/GlowButton";
@@ -12,6 +12,7 @@ const Signup = () => {
   const [confirmPw, setConfirmPw] = useState("");
   const [name, setName] = useState("");
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { signUpWithPassword, loading, error } = useSupabaseAuth();
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -28,11 +29,13 @@ const Signup = () => {
     try {
       const data = await signUpWithPassword(email, pw, name.trim() || undefined);
       if (data.session) {
-        navigate("/dashboard");
+        const redirect = searchParams.get("redirect");
+        navigate(redirect?.startsWith("/") && !redirect.startsWith("//") ? redirect : "/dashboard");
         return;
       }
       setNotice("Account created. Please verify your email, then log in.");
-      navigate("/login");
+      const redirect = searchParams.get("redirect");
+      navigate(redirect ? `/login?redirect=${encodeURIComponent(redirect)}` : "/login");
     } catch (err) {
       console.error(err);
     }

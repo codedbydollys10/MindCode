@@ -4,17 +4,20 @@ import { getSupabaseClient } from "@/lib/supabase";
 
 export type CollaborationRoom = {
   id: string;
+  publicId?: string;
+  roomCode?: string;
   language: string;
-  role: "owner" | "member";
+  role: "owner" | "member" | "teacher";
 };
 
 export type CollaborationParticipant = {
   id: string;
   name: string;
+  role?: "owner" | "member" | "teacher";
   isSelf: boolean;
 };
 
-export type CollaborationStatus = "loading" | "connecting" | "connected" | "reconnecting" | "error";
+export type CollaborationStatus = "loading" | "pending" | "connecting" | "connected" | "reconnecting" | "error";
 
 const API_BASE = import.meta.env.VITE_COLLABORATION_API_URL
   || import.meta.env.VITE_CODE_RUNNER_URL
@@ -29,6 +32,17 @@ const encodeUpdate = (update: Uint8Array) => {
   return btoa(binary);
 };
 
+const acceptTeacherInvite = async (roomId: string, inviteCode: string, headers: { Authorization: string }) => {
+  const response = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}/teacher-invites/accept`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ inviteCode }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || "Unable to accept this teacher invitation.");
+  return body.room as CollaborationRoom;
+};
+
 const requestRoom = async (roomId: string, inviteCode: string | null, accessToken: string) => {
   const headers = { Authorization: `Bearer ${accessToken}` };
   let response = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}`, { headers });
@@ -39,6 +53,15 @@ const requestRoom = async (roomId: string, inviteCode: string | null, accessToke
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ inviteCode }),
     });
+  } else if (response.status === 403) {
+    response = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}/requests`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+    });
+    const requestBody = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(requestBody.error || "Unable to request access to this coding room.");
+    if (requestBody.status === "pending" || requestBody.status === "accepted") return null;
+    response = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}`, { headers });
   }
 
   const body = await response.json().catch(() => ({}));
@@ -46,7 +69,12 @@ const requestRoom = async (roomId: string, inviteCode: string | null, accessToke
   return body.room as CollaborationRoom;
 };
 
-export const useCollaborationRoom = (roomId: string | undefined, userId: string | undefined, inviteCode: string | null) => {
+export const useCollaborationRoom = (
+  roomId: string | undefined,
+  userId: string | undefined,
+  inviteCode: string | null,
+  teacherInviteCode: string | null,
+) => {
   const [room, setRoom] = useState<CollaborationRoom | null>(null);
   const [document, setDocument] = useState<Y.Doc | null>(null);
   const [participants, setParticipants] = useState<CollaborationParticipant[]>([]);
@@ -134,7 +162,55 @@ export const useCollaborationRoom = (roomId: string | undefined, userId: string 
         const { data, error: sessionError } = await getSupabaseClient().auth.getSession();
         const accessToken = data.session?.access_token;
         if (sessionError || !accessToken) throw new Error("Sign in to open a coding room.");
-        const roomDetails = await requestRoom(roomId, inviteCode, accessToken);
+        let roomDetails: CollaborationRoom | null;
+        if (teacherInviteCode) {
+          const headers = { Authorization: `Bearer ${accessToken}` };
+          const existingRoomResponse = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}`, { headers });
+          if (existingRoomResponse.ok) {
+            const existingRoom = (await existingRoomResponse.json()).room as CollaborationRoom;
+            if (existingRoom.role === "teacher" || existingRoom.role === "owner") {
+              roomDetails = existingRoom;
+            } else {
+              roomDetails = await acceptTeacherInvite(roomId, teacherInviteCode, headers);
+            }
+          } else if (existingRoomResponse.status === 403) {
+            roomDetails = await acceptTeacherInvite(roomId, teacherInviteCode, headers);
+          } else {
+            const body = await existingRoomResponse.json().catch(() => ({}));
+            throw new Error(body.error || "Unable to open this teacher invitation.");
+          }
+        } else {
+          roomDetails = await requestRoom(roomId, inviteCode, accessToken);
+        }
+        if (!roomDetails) {
+          setStatus("pending");
+          setError("Access request sent. Waiting for the room owner to respond.");
+          while (!disposed) {
+            await new Promise((resolve) => window.setTimeout(resolve, 2000));
+            const { data: refreshedSession, error: refreshError } = await getSupabaseClient().auth.getSession();
+            const refreshedToken = refreshedSession.session?.access_token;
+            if (refreshError || !refreshedToken) throw new Error("Your sign-in session has expired. Please sign in again.");
+            const requestResponse = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}/request`, {
+              headers: { Authorization: `Bearer ${refreshedToken}` },
+            });
+            const requestBody = await requestResponse.json().catch(() => ({}));
+            if (!requestResponse.ok) throw new Error(requestBody.error || "Unable to check the room access request.");
+            if (requestBody.status === "rejected") throw new Error("The room owner declined your access request.");
+            if (requestBody.status === "accepted") {
+              const roomResponse = await fetch(`${API_BASE}/api/collaboration/rooms/${roomId}`, {
+                headers: { Authorization: `Bearer ${refreshedToken}` },
+              });
+              const roomBody = await roomResponse.json().catch(() => ({}));
+              if (roomResponse.status === 403) continue;
+              if (!roomResponse.ok) throw new Error(roomBody.error || "Unable to open this coding room.");
+              roomDetails = roomBody.room as CollaborationRoom;
+              setStatus("loading");
+              setError(null);
+              break;
+            }
+          }
+        }
+        if (disposed || !roomDetails) return;
         if (disposed) return;
         const nextDocument = new Y.Doc();
         ydoc = nextDocument;
@@ -161,7 +237,7 @@ export const useCollaborationRoom = (roomId: string | undefined, userId: string 
       ydoc?.destroy();
       setParticipants([]);
     };
-  }, [roomId, userId, inviteCode]);
+  }, [roomId, userId, inviteCode, teacherInviteCode]);
 
   return { room, document, participants, status, error };
 };

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
+    "dev": "node ../scripts/cleanup-project-node-processes.mjs && node ../scripts/ensure-free-port.mjs 3001 && node --watch server.js",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

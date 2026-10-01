@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host localhost --port 8080 --strictPort",
+    "dev": "node ../scripts/cleanup-project-node-processes.mjs && node ../scripts/ensure-free-port.mjs 8080 && vite --host localhost --port 8080",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "lint": "eslint .",

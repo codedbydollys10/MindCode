@@ -1,5 +1,5 @@
 import { useState, FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Brain, Eye, EyeOff, Check } from "lucide-react";
 import GlowButton from "@/components/GlowButton";
@@ -11,6 +11,7 @@ const Login = () => {
   const [password, setPassword] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { signInWithPassword, resendSignupConfirmation, loading, error } = useSupabaseAuth();
 
   const needsConfirmation = Boolean(error && /confirm|confirmed|verify/i.test(error));
@@ -20,7 +21,8 @@ const Login = () => {
     setNotice(null);
     try {
       await signInWithPassword(email, password);
-      navigate("/dashboard");
+      const redirect = searchParams.get("redirect");
+      navigate(redirect?.startsWith("/") && !redirect.startsWith("//") ? redirect : "/dashboard");
     } catch (err) {
       console.error(err);
     }

@@ -358,6 +358,7 @@ create index if not exists idx_recs_user on public.recommendations (user_id, cre
 -- access to these tables.
 create table if not exists public.collaboration_rooms (
   id uuid primary key,
+  room_code text not null unique,
   created_by uuid not null references auth.users(id) on delete cascade,
   invite_hash text not null unique,
   language text not null check (language in ('python', 'javascript', 'java', 'cpp', 'c', 'go', 'rust')),
@@ -365,6 +366,9 @@ create table if not exists public.collaboration_rooms (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+create unique index if not exists idx_collaboration_rooms_room_code
+  on public.collaboration_rooms (room_code);
 
 create table if not exists public.collaboration_room_members (
   room_id uuid not null references public.collaboration_rooms(id) on delete cascade,
@@ -374,10 +378,59 @@ create table if not exists public.collaboration_room_members (
   primary key (room_id, user_id)
 );
 
+alter table public.collaboration_room_members
+  drop constraint if exists collaboration_room_members_role_check;
+alter table public.collaboration_room_members
+  add constraint collaboration_room_members_role_check check (role in ('owner', 'member', 'teacher'));
+
+create table if not exists public.collaboration_room_join_requests (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid not null references public.collaboration_rooms(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  requester_name text not null,
+  status text not null check (status in ('pending', 'accepted', 'rejected')),
+  requested_at timestamptz not null default now(),
+  decided_by uuid references auth.users(id) on delete set null,
+  decided_at timestamptz,
+  unique (room_id, user_id)
+);
+
+create table if not exists public.collaboration_room_teacher_invites (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid not null references public.collaboration_rooms(id) on delete cascade,
+  token_hash text not null unique,
+  invited_by uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  redeemed_at timestamptz,
+  redeemed_by uuid references auth.users(id) on delete set null
+);
+
+create table if not exists public.collaboration_room_feedback (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid not null references public.collaboration_rooms(id) on delete cascade,
+  author_id uuid not null references auth.users(id) on delete cascade,
+  message text not null check (char_length(message) between 1 and 2000),
+  line_number integer check (line_number is null or line_number > 0),
+  created_at timestamptz not null default now()
+);
+
 create index if not exists idx_collaboration_members_user
   on public.collaboration_room_members (user_id, room_id);
 
+create index if not exists idx_collaboration_join_requests_pending
+  on public.collaboration_room_join_requests (room_id, requested_at)
+  where status = 'pending';
+create index if not exists idx_collaboration_teacher_invites_room
+  on public.collaboration_room_teacher_invites (room_id, expires_at)
+  where redeemed_at is null;
+create index if not exists idx_collaboration_feedback_room
+  on public.collaboration_room_feedback (room_id, created_at);
+
 alter table public.collaboration_rooms enable row level security;
 alter table public.collaboration_room_members enable row level security;
-revoke all on public.collaboration_rooms, public.collaboration_room_members from anon, authenticated;
-grant select, insert, update, delete on public.collaboration_rooms, public.collaboration_room_members to service_role;
+alter table public.collaboration_room_join_requests enable row level security;
+alter table public.collaboration_room_teacher_invites enable row level security;
+alter table public.collaboration_room_feedback enable row level security;
+revoke all on public.collaboration_rooms, public.collaboration_room_members, public.collaboration_room_join_requests, public.collaboration_room_teacher_invites, public.collaboration_room_feedback from anon, authenticated;
+grant select, insert, update, delete on public.collaboration_rooms, public.collaboration_room_members, public.collaboration_room_join_requests, public.collaboration_room_teacher_invites, public.collaboration_room_feedback to service_role;

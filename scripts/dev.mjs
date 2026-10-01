@@ -55,6 +55,18 @@ const cleanup = (children) => {
 
 const children = [];
 
+const cleanupCommand = [path.join(rootDir, 'scripts', 'cleanup-project-node-processes.mjs')];
+const cleanupResult = spawnSync(process.execPath, cleanupCommand, {
+  cwd: rootDir,
+  stdio: 'inherit',
+  env: process.env,
+});
+
+if (cleanupResult.status !== 0) {
+  console.error('[dev] Cleanup step failed before startup.');
+  process.exit(cleanupResult.status ?? 1);
+}
+
 if (!fs.existsSync(viteBin)) {
   console.log('[dev] Frontend dependencies missing; running npm install in frontend.');
   const install = spawnSync(npmRunner, npmArgs(['install', '--include=dev']), {
@@ -78,7 +90,7 @@ if (await isPortOpen(3001)) {
 console.log('[dev] Starting frontend on port 8080.');
 const frontend = spawnProcess(
   frontendDir,
-  ['run', 'dev', '--', '--host', 'localhost', '--port', '8080', '--strictPort'],
+  ['run', 'dev', '--', '--host', 'localhost', '--port', '8080'],
   'frontend',
 );
 children.push(frontend);

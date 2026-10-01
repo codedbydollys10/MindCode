@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js';
 import { v4 as uuid } from 'uuid';
 import { z } from 'zod';
 import Bytez from 'bytez.js';
+import { createHash } from 'node:crypto';
 import 'dotenv/config';
 import http from 'http';
 import { attachCollaborationWebSocket, createCollaborationRouter } from './lib/collaboration.mjs';
@@ -21,14 +22,66 @@ const JUDGE0_URL = process.env.JUDGE0_URL || 'https://ce.judge0.com';
 // Supabase client (service role for server-side writes)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
+const supabaseAuth = SUPABASE_URL && SUPABASE_ANON_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
+  : supabase;
 
 // Bytez/Qwen LLM (for question generation & analysis)
 const BYTEZ_API_KEY = (process.env.BYTEZ_API_KEY || '').trim();
 const BYTEZ_MODEL = encodeURIComponent(process.env.BYTEZ_MODEL || 'Qwen/Qwen3-4B');
 const llm = BYTEZ_API_KEY ? new Bytez(BYTEZ_API_KEY).model(BYTEZ_MODEL) : null;
+const requestErrorCorrection = async ({ language, code, error, problemContext }) => {
+  const groqApiKey = (process.env.GROQ_API_KEY || '').trim();
+  const groqModel = (process.env.GROQ_MODEL || '').trim();
+  if (!groqApiKey || !groqModel) throw new Error('Groq correction is not configured.');
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${groqApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    signal: AbortSignal.timeout(30000),
+    body: JSON.stringify({
+      model: groqModel,
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a programming correction assistant. Analyze only the supplied code and error. Identify the likely root cause and exact line, explain simply, give the smallest correction preserving intended logic, and return only JSON with diagnosis, errorLine, correction, correctedCode, explanation, and changes (array of strings). Do not invent errors; express uncertainty in diagnosis when information is insufficient.',
+        },
+        {
+          role: 'user',
+          content: JSON.stringify({ language, code, error, problemContext: problemContext || '' }),
+        },
+      ],
+    }),
+  });
+  const responseBody = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Groq returned HTTP ${response.status}.`);
+  const content = responseBody.choices?.[0]?.message?.content;
+  const correction = parseJsonLoose(content);
+  if (!correction || typeof correction.diagnosis !== 'string' || typeof correction.correction !== 'string'
+    || typeof correction.correctedCode !== 'string' || typeof correction.explanation !== 'string'
+    || !Array.isArray(correction.changes)) {
+    throw new Error('Groq returned an invalid correction response.');
+  }
+
+  return {
+    diagnosis: correction.diagnosis.slice(0, 2000),
+    errorLine: Number.isInteger(correction.errorLine) ? correction.errorLine : error.line ?? null,
+    correction: correction.correction.slice(0, 2000),
+    correctedCode: correction.correctedCode.slice(0, 20000),
+    explanation: correction.explanation.slice(0, 4000),
+    changes: correction.changes.filter((change) => typeof change === 'string').slice(0, 20).map((change) => change.slice(0, 500)),
+    codeHash: createHash('sha256').update(code).digest('hex'),
+  };
+};
 
 if (!llm) {
   console.warn('[Bytez] BYTEZ_API_KEY not set. Question generation/analysis will fail.');
@@ -36,6 +89,9 @@ if (!llm) {
 
 if (!supabase) {
   console.warn('[Supabase] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Telemetry will fail.');
+}
+if (!supabaseAuth) {
+  console.warn('[Supabase] SUPABASE_URL or SUPABASE_ANON_KEY not set. Collaboration auth checks will fail.');
 } else {
   console.log('[Supabase] ✅ Initialized with service role key');
 }
@@ -215,7 +271,7 @@ app.disable('x-powered-by');
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '2mb' }));
-app.use('/api/collaboration', createCollaborationRouter({ supabase }));
+app.use('/api/collaboration', createCollaborationRouter({ supabase, supabaseAuth, requestErrorCorrection }));
 
 app.use((req, _res, next) => {
   if (req.method === 'OPTIONS') {
@@ -1627,8 +1683,16 @@ app.post('/analysis', async (req, res) => {
 // Disabled on Vercel serverless runtime.
 // ────────────────────────────────────────────────────────────
 if (!IS_VERCEL) {
-  attachCollaborationWebSocket({ server, supabase, isAllowedOrigin });
-  const wss = new WebSocketServer({ server, path: '/stream' });
+  attachCollaborationWebSocket({ server, supabase, supabaseAuth, isAllowedOrigin });
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request, socket, head) => {
+    const requestUrl = new URL(request.url || '/', 'http://localhost');
+    if (requestUrl.pathname !== '/stream') return;
+    wss.handleUpgrade(request, socket, head, (webSocket) => {
+      wss.emit('connection', webSocket, request);
+    });
+  });
 
   wss.on('connection', (ws) => {
     ws.on('message', async (msg) => {

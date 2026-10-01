@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import express from 'express';
 import test from 'node:test';
@@ -10,11 +11,15 @@ const usersByToken = {
   tokenA: { id: 'user-a', email: 'a@example.test', user_metadata: { name: 'Ada' } },
   tokenB: { id: 'user-b', email: 'b@example.test', user_metadata: { name: 'Bea' } },
   tokenC: { id: 'user-c', email: 'c@example.test', user_metadata: { name: 'Cy' } },
+  tokenD: { id: 'user-d', email: 'd@example.test', user_metadata: { name: 'Dana' } },
 };
 
 const createSupabaseMock = () => {
   const rooms = new Map();
   const members = new Map();
+  const joinRequests = new Map();
+  const teacherInvites = new Map();
+  const feedback = new Map();
   const keyForMember = (roomId, userId) => `${roomId}:${userId}`;
 
   const supabase = {
@@ -28,41 +33,61 @@ const createSupabaseMock = () => {
       let payload;
       const filters = {};
       const builder = {
-        select() { action = 'select'; return builder; },
+        select() { return builder; },
         insert(value) { action = 'insert'; payload = value; return builder; },
         upsert(value) { action = 'upsert'; payload = value; return builder; },
         update(value) { action = 'update'; payload = value; return builder; },
         delete() { action = 'delete'; return builder; },
         eq(field, value) { filters[field] = value; return builder; },
+        is(field, value) { filters[field] = value; return builder; },
         maybeSingle() { return execute(true); },
         then(resolve, reject) { return execute(false).then(resolve, reject); },
       };
 
       const matches = (row) => Object.entries(filters).every(([field, value]) => row?.[field] === value);
       const execute = async (single) => {
-        const rows = table === 'collaboration_rooms' ? rooms : members;
+        const tableMap = {
+          collaboration_rooms: rooms,
+          collaboration_room_members: members,
+          collaboration_room_join_requests: joinRequests,
+          collaboration_room_teacher_invites: teacherInvites,
+          collaboration_room_feedback: feedback,
+        };
+        const rows = tableMap[table];
+        if (table === 'collaboration_rooms' && filters.id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(filters.id)) {
+          return { data: null, error: new Error(`invalid input syntax for type uuid: "${filters.id}"`) };
+        }
         if (action === 'insert') {
-          const row = { ...payload };
+          const row = { id: randomUUID(), ...payload };
           if (table === 'collaboration_rooms') rooms.set(row.id, row);
-          else members.set(keyForMember(row.room_id, row.user_id), row);
+          else if (table === 'collaboration_room_members') members.set(keyForMember(row.room_id, row.user_id), row);
+          else if (table === 'collaboration_room_join_requests') joinRequests.set(keyForMember(row.room_id, row.user_id), row);
+          else if (table === 'collaboration_room_teacher_invites') {
+            row.redeemed_at ??= null;
+            teacherInvites.set(row.id, row);
+          } else feedback.set(row.id, row);
           return { data: row, error: null };
         }
         if (action === 'upsert') {
           const key = keyForMember(payload.room_id, payload.user_id);
-          const row = { ...members.get(key), ...payload };
-          members.set(key, row);
+          const target = table === 'collaboration_room_members' ? members : table === 'collaboration_room_join_requests' ? joinRequests : teacherInvites;
+          const row = { ...target.get(key), ...payload };
+          target.set(key, row);
           return { data: row, error: null };
         }
         const found = [...rows.values()].filter(matches);
         if (action === 'select') return { data: single ? found[0] || null : found, error: null };
         if (action === 'update') {
           for (const row of found) Object.assign(row, payload);
-          return { data: found, error: null };
+          return { data: single ? found[0] || null : found, error: null };
         }
         if (action === 'delete') {
           for (const row of found) {
             if (table === 'collaboration_rooms') rooms.delete(row.id);
-            else members.delete(keyForMember(row.room_id, row.user_id));
+            else if (table === 'collaboration_room_members') members.delete(keyForMember(row.room_id, row.user_id));
+            else if (table === 'collaboration_room_join_requests') joinRequests.delete(keyForMember(row.room_id, row.user_id));
+            else if (table === 'collaboration_room_teacher_invites') teacherInvites.delete(row.id);
+            else feedback.delete(row.id);
           }
           return { data: found, error: null };
         }
@@ -110,6 +135,307 @@ const closeClient = (client) => new Promise((resolve) => {
   if (client.socket.readyState === WebSocket.CLOSED) return resolve();
   client.socket.once('close', resolve);
   client.socket.close();
+});
+
+test('room creation returns a shareable public room code and resolves room lookups by that code', async () => {
+  const { supabase } = createSupabaseMock();
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase }));
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const apiBase = `http://127.0.0.1:${address.port}`;
+  const createResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer tokenA', 'content-type': 'application/json' },
+    body: JSON.stringify({ language: 'python' }),
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  assert.match(created.room.publicId || created.room.roomCode || created.room.id, /^MC-[A-Z0-9]{6}$/);
+
+  const lookupResponse = await fetch(`${apiBase}/api/collaboration/rooms/${created.room.publicId || created.room.roomCode}`, {
+    headers: { authorization: 'Bearer tokenA' },
+  });
+  assert.equal(lookupResponse.status, 200);
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test('room owners approve or reject access requests before non-members can enter', async (t) => {
+  const { supabase } = createSupabaseMock();
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase }));
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const apiBase = `http://127.0.0.1:${server.address().port}`;
+  const headersFor = (token) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
+
+  const createResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST',
+    headers: headersFor('tokenA'),
+    body: JSON.stringify({ language: 'python' }),
+  });
+  const created = await createResponse.json();
+  const roomId = created.room.publicId;
+
+  const requestResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests`, {
+    method: 'POST',
+    headers: headersFor('tokenB'),
+  });
+  assert.equal(requestResponse.status, 202);
+  assert.deepEqual(await requestResponse.json(), { status: 'pending' });
+
+  const ownerQueueResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests`, {
+    headers: headersFor('tokenA'),
+  });
+  const ownerQueue = await ownerQueueResponse.json();
+  assert.equal(ownerQueueResponse.status, 200);
+  assert.equal(ownerQueue.requests[0].requester_name, 'Bea');
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests`, {
+    headers: headersFor('tokenB'),
+  })).status, 403);
+
+  const acceptResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests/${ownerQueue.requests[0].id}`, {
+    method: 'PATCH',
+    headers: headersFor('tokenA'),
+    body: JSON.stringify({ decision: 'accepted' }),
+  });
+  assert.equal(acceptResponse.status, 200);
+  assert.equal((await acceptResponse.json()).request.status, 'accepted');
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}`, {
+    headers: headersFor('tokenB'),
+  })).status, 200);
+
+  const rejectedRequestResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests`, {
+    method: 'POST',
+    headers: headersFor('tokenC'),
+  });
+  assert.equal(rejectedRequestResponse.status, 202);
+  const refreshedQueue = await (await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests`, {
+    headers: headersFor('tokenA'),
+  })).json();
+  const requestToReject = refreshedQueue.requests.find((request) => request.user_id === 'user-c');
+  const rejectResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/requests/${requestToReject.id}`, {
+    method: 'PATCH',
+    headers: headersFor('tokenA'),
+    body: JSON.stringify({ decision: 'rejected' }),
+  });
+  assert.equal(rejectResponse.status, 200);
+  assert.equal((await (await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/request`, {
+    headers: headersFor('tokenC'),
+  })).json()).status, 'rejected');
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}`, {
+    headers: headersFor('tokenC'),
+  })).status, 403);
+});
+
+test('teacher invitations grant read-only room-scoped teacher access and feedback', async (t) => {
+  const { supabase } = createSupabaseMock();
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase }));
+  const server = createServer(app);
+  attachCollaborationWebSocket({ server, supabase, isAllowedOrigin: () => true });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const apiBase = `http://127.0.0.1:${server.address().port}`;
+  const socketUrl = `ws://127.0.0.1:${server.address().port}/collaboration`;
+  const headersFor = (token) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
+  const clients = [];
+  t.after(async () => {
+    await Promise.all(clients.map(closeClient));
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const createRoomResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({ language: 'python' }),
+  });
+  const created = await createRoomResponse.json();
+  const roomId = created.room.publicId;
+  const inviteResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/teacher-invites`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({}),
+  });
+  const teacherInvite = await inviteResponse.json();
+  assert.equal(inviteResponse.status, 201);
+  assert.equal(teacherInvite.inviteCode.length >= 20, true);
+
+  const reusedResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/teacher-invites`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({ inviteCode: teacherInvite.inviteCode }),
+  });
+  assert.equal((await reusedResponse.json()).inviteCode, teacherInvite.inviteCode);
+  const unrelatedRoomResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({ language: 'python' }),
+  });
+  const unrelatedRoom = await unrelatedRoomResponse.json();
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${unrelatedRoom.room.publicId}/teacher-invites/accept`, {
+    method: 'POST', headers: headersFor('tokenC'), body: JSON.stringify({ inviteCode: teacherInvite.inviteCode }),
+  })).status, 404);
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/teacher-invites`, {
+    method: 'POST', headers: headersFor('tokenB'), body: JSON.stringify({}),
+  })).status, 403);
+
+  const regularJoin = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/join`, {
+    method: 'POST', headers: headersFor('tokenB'), body: JSON.stringify({ inviteCode: created.inviteCode }),
+  });
+  assert.equal(regularJoin.status, 200);
+  assert.equal((await (await fetch(`${apiBase}/api/collaboration/rooms/${roomId}`, {
+    headers: headersFor('tokenB'),
+  })).json()).room.role, 'member');
+
+  const acceptedResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/teacher-invites/accept`, {
+    method: 'POST', headers: headersFor('tokenB'), body: JSON.stringify({ inviteCode: teacherInvite.inviteCode }),
+  });
+  assert.equal(acceptedResponse.status, 200);
+  assert.equal((await acceptedResponse.json()).room.role, 'teacher');
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/teacher-invites/accept`, {
+    method: 'POST', headers: headersFor('tokenC'), body: JSON.stringify({ inviteCode: teacherInvite.inviteCode }),
+  })).status, 404);
+
+  const feedbackResponse = await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/feedback`, {
+    method: 'POST', headers: headersFor('tokenB'), body: JSON.stringify({ message: 'Check the loop condition.', lineNumber: 3 }),
+  });
+  assert.equal(feedbackResponse.status, 201);
+  assert.equal((await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/feedback`, {
+    method: 'POST', headers: headersFor('tokenC'), body: JSON.stringify({ message: 'Unauthorized feedback.' }),
+  })).status, 403);
+  const visibleFeedback = await (await fetch(`${apiBase}/api/collaboration/rooms/${roomId}/feedback`, {
+    headers: headersFor('tokenA'),
+  })).json();
+  assert.equal(visibleFeedback.feedback[0].message, 'Check the loop condition.');
+
+  const otherRoomResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({ language: 'python' }),
+  });
+  const otherRoom = await otherRoomResponse.json();
+  const isolatedFeedback = await (await fetch(`${apiBase}/api/collaboration/rooms/${otherRoom.room.publicId}/feedback`, {
+    headers: headersFor('tokenA'),
+  })).json();
+  assert.deepEqual(isolatedFeedback.feedback, []);
+
+  const ownerClient = await connectClient(socketUrl, roomId, 'tokenA');
+  const teacherClient = await connectClient(socketUrl, roomId, 'tokenB');
+  clients.push(ownerClient, teacherClient);
+  const participantUpdate = await waitForMessage(ownerClient, (message) => message.type === 'participants' && message.participants.length === 2, 'student and teacher participants');
+  assert.deepEqual(participantUpdate.participants.map((participant) => participant.role).sort(), ['owner', 'teacher']);
+  const vector = Y.encodeStateVector(teacherClient.document);
+  teacherClient.document.getText('code').insert(0, 'teacher edit');
+  teacherClient.socket.send(JSON.stringify({
+    type: 'update',
+    update: Buffer.from(Y.encodeStateAsUpdate(teacherClient.document, vector)).toString('base64'),
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(ownerClient.document.getText('code').toString(), '');
+});
+
+test('AI error correction is explicit, room-member scoped, and returns structured suggestions', async (t) => {
+  const { supabase } = createSupabaseMock();
+  const receivedContexts = [];
+  const requestErrorCorrection = async (context) => {
+    receivedContexts.push(context);
+    return {
+      diagnosis: 'A semicolon is missing.',
+      errorLine: context.error.line,
+      correction: 'Add a semicolon at the end of the statement.',
+      correctedCode: `${context.code};`,
+      explanation: 'This language requires a statement terminator.',
+      changes: ['Added a semicolon.'],
+      codeHash: 'current-code-hash',
+    };
+  };
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase, requestErrorCorrection }));
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const apiBase = `http://127.0.0.1:${server.address().port}`;
+  const headersFor = (token) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
+  const roomResponse = await fetch(`${apiBase}/api/collaboration/rooms`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify({ language: 'cpp' }),
+  });
+  const room = (await roomResponse.json()).room;
+  const context = {
+    language: 'cpp',
+    code: 'std::cout << "hello"',
+    error: { type: 'compile', message: "expected ';'", line: 4, column: 18 },
+    problemContext: 'Print hello.',
+  };
+
+  const denied = await fetch(`${apiBase}/api/collaboration/rooms/${room.publicId}/error-correction`, {
+    method: 'POST', headers: headersFor('tokenB'), body: JSON.stringify(context),
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(receivedContexts.length, 0);
+
+  const response = await fetch(`${apiBase}/api/collaboration/rooms/${room.publicId}/error-correction`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify(context),
+  });
+  const suggestion = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(suggestion.diagnosis, 'A semicolon is missing.');
+  assert.equal(suggestion.errorLine, 4);
+  assert.equal(suggestion.correctedCode, `${context.code};`);
+  assert.deepEqual(receivedContexts[0], context);
+
+  const unavailableApp = express();
+  unavailableApp.use(express.json());
+  unavailableApp.use('/api/collaboration', createCollaborationRouter({ supabase }));
+  const unavailableServer = createServer(unavailableApp);
+  await new Promise((resolve) => unavailableServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => unavailableServer.close(resolve)));
+  const unavailable = await fetch(`http://127.0.0.1:${unavailableServer.address().port}/api/collaboration/rooms/${room.publicId}/error-correction`, {
+    method: 'POST', headers: headersFor('tokenA'), body: JSON.stringify(context),
+  });
+  assert.equal(unavailable.status, 503);
+  assert.match((await unavailable.json()).error, /temporarily unavailable/i);
+});
+
+test('room creation surfaces a missing Supabase schema as an actionable backend error', async () => {
+  const missingSchemaSupabase = {
+    auth: {
+      getUser: async (token) => usersByToken[token]
+        ? { data: { user: usersByToken[token] }, error: null }
+        : { data: { user: null }, error: new Error('Invalid token') },
+    },
+    from(table) {
+      return {
+        insert() {
+          return {
+            error: {
+              code: '42P01',
+              message: "Could not find the table 'public.collaboration_rooms' in the schema cache",
+            },
+          };
+        },
+        delete() {
+          return { error: null };
+        },
+        select() { return { data: [], error: null }; },
+        eq() { return this; },
+        maybeSingle() { return { data: null, error: null }; },
+        upsert() { return { data: null, error: null }; },
+      };
+    },
+  };
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase: missingSchemaSupabase }));
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const response = await fetch(`http://127.0.0.1:${address.port}/api/collaboration/rooms`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer tokenA', 'content-type': 'application/json' },
+    body: JSON.stringify({ language: 'python' }),
+  });
+
+  assert.equal(response.status, 503);
+  const body = await response.json();
+  assert.match(body.error, /frontend\/supabase_schema\.sql/i);
+  await new Promise((resolve) => server.close(resolve));
 });
 
 test('authenticated clients sync only within their joined room and reconnect from saved state', async (t) => {
