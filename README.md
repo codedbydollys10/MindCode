@@ -334,6 +334,7 @@ npm run dev            # Start with hot-reload
 3. Commit with a clear message: `git commit -m "feat: add X"`
 4. Push and open a Pull Request
 
+
 Please ensure `npm run lint` passes and all existing tests are green before submitting.
 
 ---
