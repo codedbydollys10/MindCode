@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
+import { BrowserRouter, Route, Routes, Navigate, useParams } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -17,8 +17,14 @@ import NotFound from "./pages/NotFound";
 import AuthListener from "./components/AuthListener";
 import AIRecommendations from "./pages/AIRecommendations";
 import CollaborativeCoding from "./pages/CollaborativeCoding";
+import TeacherDashboard from "./pages/TeacherDashboard";
 
 const queryClient = new QueryClient();
+
+const JoinAssignmentRedirect = () => {
+  const { joinCode = "" } = useParams();
+  return <Navigate to={`/collaborate?assignmentCode=${encodeURIComponent(joinCode)}`} replace />;
+};
 
 const App = () => (
   <QueryClientProvider client={queryClient}>
@@ -47,6 +53,8 @@ const App = () => (
           <Route path="/recommendations" element={<AIRecommendations />} />
           <Route path="/collaborate" element={<CollaborativeCoding />} />
           <Route path="/collaborate/:roomId" element={<CollaborativeCoding />} />
+          <Route path="/join/:joinCode" element={<JoinAssignmentRedirect />} />
+          <Route path="/teacher/dashboard" element={<TeacherDashboard />} />
 
           {/* fallback */}
           <Route path="*" element={<Navigate to="/" replace />} />

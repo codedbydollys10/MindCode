@@ -12,6 +12,10 @@ const usersByToken = {
   tokenB: { id: 'user-b', email: 'b@example.test', user_metadata: { name: 'Bea' } },
   tokenC: { id: 'user-c', email: 'c@example.test', user_metadata: { name: 'Cy' } },
   tokenD: { id: 'user-d', email: 'd@example.test', user_metadata: { name: 'Dana' } },
+  assignmentTeacher: { id: '10000000-0000-4000-8000-000000000001', email: 'teacher@example.test', app_metadata: { role: 'teacher' }, user_metadata: { name: 'Terry Teacher' } },
+  assignmentTeacherOther: { id: '10000000-0000-4000-8000-000000000002', email: 'other-teacher@example.test', app_metadata: { role: 'teacher' }, user_metadata: { name: 'Other Teacher' } },
+  assignmentStudentA: { id: '20000000-0000-4000-8000-000000000001', email: 'student-a@example.test', app_metadata: { role: 'student' }, user_metadata: { name: 'Student A' } },
+  assignmentStudentB: { id: '20000000-0000-4000-8000-000000000002', email: 'student-b@example.test', app_metadata: { role: 'student' }, user_metadata: { name: 'Student B' } },
 };
 
 const createSupabaseMock = () => {
@@ -20,6 +24,13 @@ const createSupabaseMock = () => {
   const joinRequests = new Map();
   const teacherInvites = new Map();
   const feedback = new Map();
+  const assignments = new Map();
+  const workspaces = new Map();
+  const assignmentProgress = new Map();
+  const assignmentSubmissions = new Map();
+  const assignmentRuns = new Map();
+  const assignmentFeedbackRequests = new Map();
+  const assignmentFeedback = new Map();
   const keyForMember = (roomId, userId) => `${roomId}:${userId}`;
 
   const supabase = {
@@ -40,6 +51,7 @@ const createSupabaseMock = () => {
         delete() { action = 'delete'; return builder; },
         eq(field, value) { filters[field] = value; return builder; },
         is(field, value) { filters[field] = value; return builder; },
+        order() { return builder; },
         maybeSingle() { return execute(true); },
         then(resolve, reject) { return execute(false).then(resolve, reject); },
       };
@@ -52,6 +64,13 @@ const createSupabaseMock = () => {
           collaboration_room_join_requests: joinRequests,
           collaboration_room_teacher_invites: teacherInvites,
           collaboration_room_feedback: feedback,
+          collaboration_assignments: assignments,
+          collaboration_assignment_workspaces: workspaces,
+          collaboration_assignment_progress: assignmentProgress,
+          collaboration_assignment_submissions: assignmentSubmissions,
+          collaboration_assignment_runs: assignmentRuns,
+          collaboration_assignment_feedback_requests: assignmentFeedbackRequests,
+          collaboration_assignment_feedback: assignmentFeedback,
         };
         const rows = tableMap[table];
         if (table === 'collaboration_rooms' && filters.id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(filters.id)) {
@@ -65,12 +84,26 @@ const createSupabaseMock = () => {
           else if (table === 'collaboration_room_teacher_invites') {
             row.redeemed_at ??= null;
             teacherInvites.set(row.id, row);
-          } else feedback.set(row.id, row);
+          } else if (table === 'collaboration_room_feedback') feedback.set(row.id, row);
+          else if (table === 'collaboration_assignments') assignments.set(row.room_id, row);
+          else if (table === 'collaboration_assignment_workspaces') workspaces.set(keyForMember(row.room_id, row.user_id), row);
+          else if (table === 'collaboration_assignment_progress') assignmentProgress.set(keyForMember(row.room_id, row.user_id), row);
+          else if (table === 'collaboration_assignment_submissions') assignmentSubmissions.set(row.id, row);
+          else if (table === 'collaboration_assignment_runs') assignmentRuns.set(row.id, row);
+          else if (table === 'collaboration_assignment_feedback_requests') assignmentFeedbackRequests.set(row.id, row);
+          else assignmentFeedback.set(row.id, row);
           return { data: row, error: null };
         }
         if (action === 'upsert') {
-          const key = keyForMember(payload.room_id, payload.user_id);
-          const target = table === 'collaboration_room_members' ? members : table === 'collaboration_room_join_requests' ? joinRequests : teacherInvites;
+          const key = table === 'collaboration_rooms'
+            ? payload.id
+            : table === 'collaboration_assignments'
+              ? payload.room_id
+              : ['collaboration_room_members', 'collaboration_room_join_requests', 'collaboration_assignment_workspaces', 'collaboration_assignment_progress'].includes(table)
+                ? keyForMember(payload.room_id, payload.user_id)
+                : payload.id;
+          const target = tableMap[table];
+          if (!target) throw new Error(`Unknown table: ${table}`);
           const row = { ...target.get(key), ...payload };
           target.set(key, row);
           return { data: row, error: null };
@@ -87,7 +120,14 @@ const createSupabaseMock = () => {
             else if (table === 'collaboration_room_members') members.delete(keyForMember(row.room_id, row.user_id));
             else if (table === 'collaboration_room_join_requests') joinRequests.delete(keyForMember(row.room_id, row.user_id));
             else if (table === 'collaboration_room_teacher_invites') teacherInvites.delete(row.id);
-            else feedback.delete(row.id);
+            else if (table === 'collaboration_room_feedback') feedback.delete(row.id);
+            else if (table === 'collaboration_assignments') assignments.delete(row.room_id);
+            else if (table === 'collaboration_assignment_workspaces') workspaces.delete(keyForMember(row.room_id, row.user_id));
+            else if (table === 'collaboration_assignment_progress') assignmentProgress.delete(keyForMember(row.room_id, row.user_id));
+            else if (table === 'collaboration_assignment_submissions') assignmentSubmissions.delete(row.id);
+            else if (table === 'collaboration_assignment_runs') assignmentRuns.delete(row.id);
+            else if (table === 'collaboration_assignment_feedback_requests') assignmentFeedbackRequests.delete(row.id);
+            else assignmentFeedback.delete(row.id);
           }
           return { data: found, error: null };
         }
@@ -153,6 +193,7 @@ test('room creation returns a shareable public room code and resolves room looku
   });
   assert.equal(createResponse.status, 201);
   const created = await createResponse.json();
+  assert.equal(created.room.roomType, 'collaborative');
   assert.match(created.room.publicId || created.room.roomCode || created.room.id, /^MC-[A-Z0-9]{6}$/);
 
   const lookupResponse = await fetch(`${apiBase}/api/collaboration/rooms/${created.room.publicId || created.room.roomCode}`, {
@@ -160,6 +201,147 @@ test('room creation returns a shareable public room code and resolves room looku
   });
   assert.equal(lookupResponse.status, 200);
   await new Promise((resolve) => server.close(resolve));
+});
+
+test('assignment rooms keep student work private and scope monitoring and feedback to the owner and recipient', async (t) => {
+  const { supabase } = createSupabaseMock();
+  const app = express();
+  app.use(express.json());
+  app.use('/api/collaboration', createCollaborationRouter({ supabase }));
+  const server = createServer(app);
+  const webSocketServer = attachCollaborationWebSocket({ server, supabase, isAllowedOrigin: () => true });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const apiBase = `http://127.0.0.1:${server.address().port}`;
+  const headersFor = (token) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' });
+  const clients = [];
+  t.after(async () => {
+    await Promise.all(clients.map(closeClient));
+    webSocketServer?.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const studentCreateResponse = await fetch(`${apiBase}/api/collaboration/assignments`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ roomName: 'Not a teacher', title: 'Blocked', language: 'python' }),
+  });
+  assert.equal(studentCreateResponse.status, 403);
+  const studentListResponse = await fetch(`${apiBase}/api/collaboration/assignments`, {
+    headers: headersFor('assignmentStudentA'),
+  });
+  assert.equal(studentListResponse.status, 403);
+
+  const createResponse = await fetch(`${apiBase}/api/collaboration/assignments`, {
+    method: 'POST',
+    headers: headersFor('assignmentTeacher'),
+    body: JSON.stringify({ roomName: 'CS 101', title: 'Loops practice', instructions: 'Write a for loop.', language: 'python' }),
+  });
+  assert.equal(createResponse.status, 201);
+  const { room } = await createResponse.json();
+  assert.equal(room.roomType, 'teacher_assignment');
+
+  const lookupResponse = await fetch(`${apiBase}/api/collaboration/assignments/lookup`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ roomCode: room.publicId }),
+  });
+  assert.equal(lookupResponse.status, 200);
+  assert.equal((await lookupResponse.json()).assignment.title, 'Loops practice');
+
+  for (const token of ['assignmentStudentA', 'assignmentStudentB']) {
+    const joinResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/join`, {
+      method: 'POST',
+      headers: headersFor(token),
+    });
+    assert.equal(joinResponse.status, 200);
+  }
+
+  const studentA = await connectClient(`ws://127.0.0.1:${server.address().port}/collaboration`, room.publicId, 'assignmentStudentA');
+  const studentB = await connectClient(`ws://127.0.0.1:${server.address().port}/collaboration`, room.publicId, 'assignmentStudentB');
+  clients.push(studentA, studentB);
+  studentA.document.getText('code').insert(0, 'print("private solution")');
+  studentA.socket.send(JSON.stringify({
+    type: 'update',
+    update: Buffer.from(Y.encodeStateAsUpdate(studentA.document)).toString('base64'),
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(studentB.document.getText('code').toString(), '');
+
+  const saveResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/save`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ code: 'print("private solution")' }),
+  });
+  assert.equal(saveResponse.status, 200);
+  const runResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/run`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ hasError: true }),
+  });
+  const runBody = await runResponse.json();
+  assert.equal(runBody.progress.errors, 1);
+  assert.equal(runBody.run.has_error, true);
+  const submitResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/submit`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ code: 'print("private solution")' }),
+  });
+  assert.equal((await submitResponse.json()).progress.attempts, 1);
+  const feedbackRequestResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/feedback-requests`, {
+    method: 'POST',
+    headers: headersFor('assignmentStudentA'),
+    body: JSON.stringify({ message: 'Could you explain the loop condition?' }),
+  });
+  assert.equal(feedbackRequestResponse.status, 201);
+  assert.equal((await feedbackRequestResponse.json()).request.message, 'Could you explain the loop condition?');
+
+  const forbiddenMonitoring = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/monitoring`, {
+    headers: headersFor('assignmentStudentA'),
+  });
+  assert.equal(forbiddenMonitoring.status, 403);
+  const otherTeacherMonitoring = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/monitoring`, {
+    headers: headersFor('assignmentTeacherOther'),
+  });
+  assert.equal(otherTeacherMonitoring.status, 403);
+  const teacherFeedbackResponse = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/monitoring/${usersByToken.assignmentStudentA.id}/feedback`, {
+    method: 'POST',
+    headers: headersFor('assignmentTeacher'),
+    body: JSON.stringify({ message: 'Check the loop condition.', concept: 'For loops' }),
+  });
+  assert.equal(teacherFeedbackResponse.status, 201);
+
+  const studentAFeedback = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/feedback`, {
+    headers: headersFor('assignmentStudentA'),
+  });
+  const studentBFeedback = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/feedback`, {
+    headers: headersFor('assignmentStudentB'),
+  });
+  const studentAFeedbackBody = await studentAFeedback.json();
+  const studentBFeedbackBody = await studentBFeedback.json();
+  assert.equal(studentAFeedbackBody.feedback.length, 1);
+  assert.equal(studentBFeedbackBody.feedback.length, 0);
+  assert.equal(studentAFeedbackBody.requests[0].message, 'Could you explain the loop condition?');
+  assert.equal(studentBFeedbackBody.requests.length, 0);
+  const studentBProgress = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/progress`, {
+    headers: headersFor('assignmentStudentB'),
+  });
+  const studentBHistory = await studentBProgress.json();
+  assert.equal(studentBHistory.progress.attempts, 0);
+  assert.equal(studentBHistory.submissions.length, 0);
+  assert.equal(studentBHistory.executionHistory.length, 0);
+  const teacherView = await fetch(`${apiBase}/api/collaboration/assignments/${room.id}/monitoring`, {
+    headers: headersFor('assignmentTeacher'),
+  });
+  const { students } = await teacherView.json();
+  assert.equal(teacherView.status, 200);
+  assert.equal(students.find((student) => student.userId === usersByToken.assignmentStudentA.id).currentCode, 'print("private solution")');
+  assert.equal(students.find((student) => student.userId === usersByToken.assignmentStudentB.id).currentCode, '');
+  assert.equal(students.find((student) => student.userId === usersByToken.assignmentStudentA.id).executionHistory.length, 1);
+  assert.equal(students.find((student) => student.userId === usersByToken.assignmentStudentA.id).feedbackRequests[0].message, 'Could you explain the loop condition?');
+  const teacherRooms = await fetch(`${apiBase}/api/collaboration/assignments`, {
+    headers: headersFor('assignmentTeacher'),
+  });
+  assert.equal((await teacherRooms.json()).assignments.length, 1);
 });
 
 test('room owners approve or reject access requests before non-members can enter', async (t) => {
@@ -434,7 +616,7 @@ test('room creation surfaces a missing Supabase schema as an actionable backend 
 
   assert.equal(response.status, 503);
   const body = await response.json();
-  assert.match(body.error, /frontend\/supabase_schema\.sql/i);
+  assert.match(body.error, /frontend\/migrations\/20261001_teacher_assignments\.sql/i);
   await new Promise((resolve) => server.close(resolve));
 });
 
